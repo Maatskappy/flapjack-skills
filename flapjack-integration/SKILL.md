@@ -1,6 +1,6 @@
 ---
 name: flapjack-integration
-version: 1.1.0
+version: 1.2.0
 author: Flapjack
 description: Use when implementing Flapjack AI agents into an existing or new application — installing the SDK, setting up FlapjackClient, creating threads, streaming messages, embedding chat UIs with React hooks, or connecting to the Flapjack API. Triggers on mentions of flapjack, @maats/flapjack, FlapjackClient, useChat with flapjack, or AI agent embedding.
 tags:
@@ -342,6 +342,59 @@ All endpoints accept `Authorization: Bearer fj_live_...` (API key) or Supabase J
 | `GET/POST` | `/api/runners/:id/steps` | List/add runner steps |
 | `GET/POST` | `/api/runners/:id/triggers` | List/add runner triggers |
 | `POST` | `/api/runners/:id/runs` | Trigger a run |
+| `POST` | `/api/agents/from-template` | **v0.4** Create agent with persistent Linux sandbox (one call: agent + config + bootstrap). Idempotent on `dassieAppId`. |
+| `GET` | `/api/agents/:id/sandbox/status` | **v0.4** Aggregate sandbox status (cached 10s): lifecycle, dev server, disk, last test. |
+| `POST` | `/api/agents/:id/sandbox/exec` | **v0.4** Exec shell command on sandbox. Returns **SSE** (`exec_started` / `stdout` / `stderr` / `exit`). Rate-limited 60/min/agent. |
+
+## Persistent Computer (Remote Control) — v0.4+
+
+For platforms that want to provision a Flapjack agent per app with a
+preloaded Linux sandbox (Dassie-style integration). One `createAgentFromTemplate`
+call creates the agent + boots a persistent Heyo VM with your chosen
+template + optional GitHub repo cloned + dependencies installed.
+
+Five templates: `node-playwright`, `python-jupyter`, `nextjs-fullstack`,
+`rust-cargo`, `blank`.
+
+```typescript
+import { FlapjackClient, verifyWebhookSignature } from '@maats/flapjack';
+
+const client = new FlapjackClient({ apiKey: process.env.FLAPJACK_API_KEY! });
+
+// Provision on app-create — idempotent on dassieAppId
+const res = await client.createAgentFromTemplate({
+  name: 'Grocery Tracker',
+  template: 'nextjs-fullstack',
+  repo: { url: 'https://github.com/acme/grocery', installCmd: 'pnpm install' },
+  envVars: [{ key: 'NODE_ENV', value: 'development' }],
+  webhookUrl: 'https://you.example.com/api/flapjack/webhook',
+  dassieAppId: app.id,
+});
+// Store res.agent.id; bootstrap runs in background (~1–3 min).
+
+// Watch status (cached server-side, safe to poll every 10s)
+const status = await client.getSandboxStatus(res.agent.id);
+// status.sandbox.status: 'bootstrapping' | 'ready' | 'idle' | 'stopped' | 'destroyed' | 'error'
+// status.signals.devServer?.{ port, listening }
+
+// Run commands — async iterator streams stdout/stderr
+for await (const ev of client.execSandbox(res.agent.id, { command: 'pnpm test' })) {
+  if (ev.type === 'stdout') process.stdout.write(ev.chunk);
+  if (ev.type === 'exit')   console.log('exit', ev.exitCode);
+}
+
+// Verify inbound webhooks (HMAC-SHA256, hex signature header)
+const ok = await verifyWebhookSignature(rawBody, sigHeader, process.env.WEBHOOK_SECRET!);
+```
+
+**Lifecycle webhooks** (POSTed to `webhookUrl`, signed with `X-Flapjack-Signature`):
+`bootstrap.succeeded` · `bootstrap.failed` · `sandbox.idled` · `sandbox.destroyed` · `agent.deleted`.
+
+**Cost control:** sandboxes auto-stop after 2h idle; next `exec` resumes them transparently.
+
+**Rate limits:** 60 exec/min per agent, 3 concurrent per agent, 600/min org ceiling. 429s carry `Retry-After`.
+
+**When to reach for this:** you're building an app-platform layer (like Dassie) where each app needs its own agent + persistent environment to run tests, host a dev server, or perform CI tasks. For in-conversation chat tooling, stick with the normal thread + message path — the agent gets computer tools automatically via its chat-turn config.
 
 ## Supported Models
 
