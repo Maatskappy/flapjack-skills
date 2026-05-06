@@ -1,6 +1,6 @@
 ---
 name: flapjack-integration
-version: 1.2.0
+version: 1.3.0
 author: Flapjack
 description: Use when implementing Flapjack AI agents into an existing or new application — installing the SDK, setting up FlapjackClient, creating threads, streaming messages, embedding chat UIs with React hooks, or connecting to the Flapjack API. Triggers on mentions of flapjack, @maats/flapjack, FlapjackClient, useChat with flapjack, or AI agent embedding.
 tags:
@@ -33,7 +33,7 @@ Flapjack is a hosted platform for deploying AI agents. You create agents via the
 
 | What | How |
 |------|-----|
-| Install SDK | `npm install @maats/flapjack` (v0.3.0+) |
+| Install SDK | `npm install @maats/flapjack` (v0.4.1+) |
 | API key format | `fj_live_...` (from flapjack.chat dashboard → Keys) |
 | Base URL (production) | `https://api.flapjack.dev` |
 | Base URL (local dev) | `http://localhost:3000` |
@@ -335,50 +335,76 @@ All endpoints accept `Authorization: Bearer fj_live_...` (API key) or Supabase J
 | `GET/PUT` | `/api/agents/:id/memory` | Memory configuration |
 | `GET/PUT` | `/api/agents/:id/plan` | Plan configuration |
 | `GET/PUT` | `/api/agents/:id/computer` | Computer use configuration |
+| `GET/PUT` | `/api/agents/:id/compaction` | Compaction (context management) configuration |
 | `GET/PUT` | `/api/agents/:id/credentials` | Credential resolver (BYOK) configuration |
 | `GET/PUT` | `/api/agents/:id/multiplayer` | Multiplayer configuration |
 | `GET/PUT/DELETE` | `/api/agents/:id/marketplace` | Marketplace profile |
+| `GET/POST` | `/api/agents/:id/skills` | List/install skills on an agent |
 | `GET/POST` | `/api/runners` | List/create runners (headless AI pipelines) |
 | `GET/POST` | `/api/runners/:id/steps` | List/add runner steps |
 | `GET/POST` | `/api/runners/:id/triggers` | List/add runner triggers |
 | `POST` | `/api/runners/:id/runs` | Trigger a run |
-| `POST` | `/api/agents/from-template` | **v0.4** Create agent with persistent Linux sandbox (one call: agent + config + bootstrap). Idempotent on `dassieAppId`. |
-| `GET` | `/api/agents/:id/sandbox/status` | **v0.4** Aggregate sandbox status (cached 10s): lifecycle, dev server, disk, last test. |
-| `POST` | `/api/agents/:id/sandbox/exec` | **v0.4** Exec shell command on sandbox. Returns **SSE** (`exec_started` / `stdout` / `stderr` / `exit`). Rate-limited 60/min/agent. |
+| `GET` | `/api/runners/:id/analytics` | Runner usage + per-model cost breakdown |
+| `GET/POST` | `/api/projects` | List/create projects (aesthetic grouping for agents + runners) |
+| `GET/PATCH/DELETE` | `/api/projects/:id` | Get/update/delete a project |
+| `GET` | `/api/projects/:id/members` | List runners + agents assigned to a project |
+| `GET` | `/api/skills` | List installable skills (registry) |
+| `GET` | `/api/skills/browse` | Browse public skills marketplace |
+| `GET` | `/api/logs` | List trace summaries (agent turns + runner steps) |
+| `GET` | `/api/logs/:traceId` | Get full span tree for a trace |
+| `POST` | `/api/agents/from-template` | **v0.4** Create agent with persistent Linux computer (one call: agent + config + bootstrap). Idempotent on `externalAppId`. |
+| `GET` | `/api/agents/:id/computer/status` | **v0.4** Aggregate computer status (cached 10s): lifecycle, dev server, disk, last test. |
+| `GET` | `/api/agents/:id/computer/bootstrap/stream` | **v0.4** Stream the latest bootstrap run's log via **SSE** (`log` / `status` / `done`). |
+| `POST` | `/api/agents/:id/computer/exec` | **v0.4** Exec shell command on the agent's computer. Returns **SSE** (`exec_started` / `stdout` / `stderr` / `exit`). Rate-limited 60/min/agent. |
+| `GET` | `/api/agents/:id/computer-instances` | List provider records (Heyo VMs etc.) backing the agent's computer. |
+| `GET/PUT` | `/api/threads/:id/computer` | Thread-scoped computer state. |
 
 ## Persistent Computer (Remote Control) — v0.4+
 
 For platforms that want to provision a Flapjack agent per app with a
-preloaded Linux sandbox (Dassie-style integration). One `createAgentFromTemplate`
-call creates the agent + boots a persistent Heyo VM with your chosen
-template + optional GitHub repo cloned + dependencies installed.
+preloaded Linux computer. One `createAgentFromTemplate` call creates the
+agent + boots a persistent Heyo VM with your chosen template + optional
+GitHub repo cloned + dependencies installed.
 
 Five templates: `node-playwright`, `python-jupyter`, `nextjs-fullstack`,
 `rust-cargo`, `blank`.
+
+> **Naming note (v0.4.1):** the user-facing surface is now "computer"
+> throughout — SDK methods, route paths, response shapes, and webhook
+> events. The pre-0.4.1 `sandbox` symbols (`getSandboxStatus`,
+> `execSandbox`, `dassieAppId`, `sandbox.idled`, etc.) have been removed.
 
 ```typescript
 import { FlapjackClient, verifyWebhookSignature } from '@maats/flapjack';
 
 const client = new FlapjackClient({ apiKey: process.env.FLAPJACK_API_KEY! });
 
-// Provision on app-create — idempotent on dassieAppId
+// Provision on app-create — idempotent on externalAppId
 const res = await client.createAgentFromTemplate({
   name: 'Grocery Tracker',
   template: 'nextjs-fullstack',
   repo: { url: 'https://github.com/acme/grocery', installCmd: 'pnpm install' },
   envVars: [{ key: 'NODE_ENV', value: 'development' }],
   webhookUrl: 'https://you.example.com/api/flapjack/webhook',
-  dassieAppId: app.id,
+  externalAppId: app.id,
 });
 // Store res.agent.id; bootstrap runs in background (~1–3 min).
+// res.computer.status is the initial lifecycle status.
+
+// Optional: stream the bootstrap log live (closes on done)
+for await (const ev of client.streamBootstrap(res.agent.id)) {
+  if (ev.type === 'log')    process.stdout.write(ev.chunk);
+  if (ev.type === 'status') console.log('→', ev.status);
+  if (ev.type === 'done')   break;
+}
 
 // Watch status (cached server-side, safe to poll every 10s)
-const status = await client.getSandboxStatus(res.agent.id);
-// status.sandbox.status: 'bootstrapping' | 'ready' | 'idle' | 'stopped' | 'destroyed' | 'error'
+const status = await client.getComputerStatus(res.agent.id);
+// status.computer.status: 'bootstrapping' | 'ready' | 'idle' | 'stopped' | 'destroyed' | 'error'
 // status.signals.devServer?.{ port, listening }
 
 // Run commands — async iterator streams stdout/stderr
-for await (const ev of client.execSandbox(res.agent.id, { command: 'pnpm test' })) {
+for await (const ev of client.execComputer(res.agent.id, { command: 'pnpm test' })) {
   if (ev.type === 'stdout') process.stdout.write(ev.chunk);
   if (ev.type === 'exit')   console.log('exit', ev.exitCode);
 }
@@ -388,13 +414,15 @@ const ok = await verifyWebhookSignature(rawBody, sigHeader, process.env.WEBHOOK_
 ```
 
 **Lifecycle webhooks** (POSTed to `webhookUrl`, signed with `X-Flapjack-Signature`):
-`bootstrap.succeeded` · `bootstrap.failed` · `sandbox.idled` · `sandbox.destroyed` · `agent.deleted`.
+`bootstrap.succeeded` · `bootstrap.failed` · `computer.idled` · `computer.destroyed` · `agent.deleted`.
 
-**Cost control:** sandboxes auto-stop after 2h idle; next `exec` resumes them transparently.
+**Cost control:** computers auto-stop after 2h idle; next `exec` resumes them transparently.
 
 **Rate limits:** 60 exec/min per agent, 3 concurrent per agent, 600/min org ceiling. 429s carry `Retry-After`.
 
-**When to reach for this:** you're building an app-platform layer (like Dassie) where each app needs its own agent + persistent environment to run tests, host a dev server, or perform CI tasks. For in-conversation chat tooling, stick with the normal thread + message path — the agent gets computer tools automatically via its chat-turn config.
+**SDK type renames (0.4.0 → 0.4.1):** `SandboxStatus` → `ComputerStatus`, `SandboxLifecycleStatus` → `ComputerLifecycleStatus`, `SandboxExecEvent` → `ComputerExecEvent`, `ExecSandboxOptions` → `ExecComputerOptions`, `SandboxWebhookEvent`/`SandboxWebhookPayload` → `ComputerWebhookEvent`/`ComputerWebhookPayload`.
+
+**When to reach for this:** you're building an app-platform layer where each app needs its own agent + persistent environment to run tests, host a dev server, or perform CI tasks. For in-conversation chat tooling, stick with the normal thread + message path — the agent gets computer tools automatically via its chat-turn config.
 
 ## Supported Models
 
@@ -405,7 +433,7 @@ Agents can be configured with these LLM models (set via dashboard or API):
 | `gpt-5.4` | OpenAI | Default. Frontier reasoning model |
 | `gpt-5.4-mini` | OpenAI | Cheaper, faster |
 | `gpt-5.4-nano` | OpenAI | High-volume, lowest cost |
-| `claude-opus-4-6` | Anthropic | Deepest reasoning, 1M context |
+| `claude-opus-4-7` | Anthropic | Deepest reasoning, 1M context |
 | `claude-sonnet-4-6` | Anthropic | Near-Opus quality, 1M context |
 | `claude-haiku-4-5` | Anthropic | Fastest, lowest cost |
 
@@ -527,11 +555,15 @@ Via the Flapjack dashboard, agents can be configured with:
 - **Memory:** Store and recall facts/preferences across conversations (agent, thread, or resource scoped)
 - **Web Tools:** Search, research, read, and crawl the web (Perplexity + Firecrawl)
 - **Plans & Todos:** Structured planning with real-time progress tracking (see below)
-- **Computer Use:** Sandboxed code execution — choose Tensorlake (fast, runs alongside agent) or Vercel Sandbox (Firecracker microVMs, reliable persistence). Configure provider per-agent.
+- **Computer Use:** Sandboxed code execution. Choose **ephemeral Tensorlake** (fast, runs alongside agent) or **persistent Heyo VM** (Firecracker microVM, reliable persistence). Provider is configurable per-agent; persistent mode is required for the Remote Control / `createAgentFromTemplate` flow.
+- **Compaction:** Automatic conversation context management. Anthropic native compaction (Claude models) or OpenAI summary-based fallback keeps long conversations coherent without exceeding context limits. Configure via `/api/agents/:id/compaction`.
 - **Multiplayer Chat:** Multi-user conversations with @mention routing
 - **Marketplace Profile:** Public agent listing with handle, avatar, capabilities, and readiness score
 - **Credential Resolution (BYOK):** Per-user API key resolution via webhook — embedding apps provide their own keys for LLM billing
-- **Analytics:** Per-agent usage tracking (tokens, cost, tool calls)
+- **Skills:** Install reusable skill packages on an agent via `/api/agents/:id/skills` (browse the registry at `/api/skills/browse`)
+- **Projects:** Aesthetic grouping for runners + agents. `project_id` is nullable on both; deleting a project demotes members rather than cascading.
+- **Logs / Tracing:** Span-tree traces for every agent turn and runner step (LLM + tool sub-spans, with rolled-up tokens + cost). Read via `/api/logs` and `/api/logs/:traceId`.
+- **Analytics:** Per-agent usage tracking (tokens, cost, tool calls, compaction costs). Runners have their own analytics endpoint with per-model cost breakdown.
 
 ## Plans & Todos (Progress Tracking)
 
@@ -598,7 +630,34 @@ const run = await client.triggerRun(runner.id, { input: { topic: 'AI news' } });
 
 Step kinds: `agent`, `webhook`, `condition`, `computer`. Trigger kinds: `manual`, `api`, `cron`, `webhook`, `poll`, `bulk_import`, `button`.
 
+Per-runner analytics (success rate, total cost, daily series, per-model
+cost breakdown) are exposed at `GET /api/runners/:id/analytics` and via
+`client.getRunnerAnalytics(runnerId, { period })`.
+
 These are configured through the dashboard and automatically available to the agent during conversations — no SDK-side configuration needed (except for custom tools, which use the `tools` option).
+
+## Projects (Aesthetic Grouping)
+
+Projects are an organizational container for runners and agents. Membership
+is purely cosmetic — `runner-engine` and `runner-config` ignore `project_id`
+entirely, so attaching/detaching a project never changes execution behavior.
+Deleting a project sets `project_id = null` on its members rather than
+cascading deletes.
+
+```typescript
+const project = await client.createProject({
+  name: 'Customer Onboarding',
+  slug: 'customer-onboarding',     // optional, normalized + nullable
+  description: 'Agents + runners that handle new-account flows',
+});
+
+// Move an agent or runner into the project
+await client.updateAgent(agentId, { projectId: project.id });
+await client.updateRunner(runnerId, { projectId: project.id });
+
+// Listing membership returns column subsets (not full Runner/Agent rows)
+const { runners, agents } = await client.getProjectMembers(project.id);
+```
 
 ## BYOK Credential Resolution
 
