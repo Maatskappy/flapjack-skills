@@ -352,14 +352,14 @@ All endpoints accept `Authorization: Bearer fj_live_...` (API key) or Supabase J
 | `GET` | `/api/skills/browse` | Browse public skills marketplace |
 | `GET` | `/api/logs` | List trace summaries (agent turns + runner steps) |
 | `GET` | `/api/logs/:traceId` | Get full span tree for a trace |
-| `POST` | `/api/agents/from-template` | **v0.4** Create agent with persistent Linux computer (one call: agent + config + bootstrap). Idempotent on `externalAppId`. |
-| `GET` | `/api/agents/:id/computer/status` | **v0.4** Aggregate computer status (cached 10s): lifecycle, dev server, disk, last test. |
-| `GET` | `/api/agents/:id/computer/bootstrap/stream` | **v0.4** Stream the latest bootstrap run's log via **SSE** (`log` / `status` / `done`). |
-| `POST` | `/api/agents/:id/computer/exec` | **v0.4** Exec shell command on the agent's computer. Returns **SSE** (`exec_started` / `stdout` / `stderr` / `exit`). Rate-limited 60/min/agent. |
+| `POST` | `/api/agents/from-template` | **v0.4.1+** Create agent with persistent Linux computer (one call: agent + config + bootstrap). Idempotent on `externalAppId`. |
+| `GET` | `/api/agents/:id/computer/status` | **v0.4.1+** Aggregate computer status (cached 10s): lifecycle, dev server, disk, last test. |
+| `GET` | `/api/agents/:id/computer/bootstrap/stream` | **v0.4.1+** Stream the latest bootstrap run's log via **SSE** (`log` / `status` / `done`). |
+| `POST` | `/api/agents/:id/computer/exec` | **v0.4.1+** Exec shell command on the agent's computer. Returns **SSE** (`exec_started` / `stdout` / `stderr` / `exit`). Rate-limited 60/min/agent. |
 | `GET` | `/api/agents/:id/computer-instances` | List provider records (Heyo VMs etc.) backing the agent's computer. |
 | `GET/PUT` | `/api/threads/:id/computer` | Thread-scoped computer state. |
 
-## Persistent Computer (Remote Control) — v0.4+
+## Persistent Computer (Remote Control) — v0.4.1+
 
 For platforms that want to provision a Flapjack agent per app with a
 preloaded Linux computer. One `createAgentFromTemplate` call creates the
