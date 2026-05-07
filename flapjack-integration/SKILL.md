@@ -55,6 +55,24 @@ NEXT_PUBLIC_FLAPJACK_BASE_URL=https://api.flapjack.dev
 
 **Security:** Never expose `fj_live_` keys in client-side code in production. Use a server-side proxy route that adds the API key, then call that route from the client.
 
+### Demo key (no signup required)
+
+For first-touch demos, scaffolding, and "does this even work" checks, use the
+public demo key:
+
+```bash
+FLAPJACK_API_KEY=fj_demo_example_key
+NEXT_PUBLIC_FLAPJACK_AGENT_ID=00000000-0000-0000-0000-0000000a6e47
+```
+
+When the API receives `fj_demo_example_key`, it short-circuits in middleware
+and returns canned responses: a stub agent, a stub thread, and a streamed SSE
+reply that explains it's a demo and links to signup. The full SDK happy path
+(`createThread`, `sendMessage`, `<ChatPanel/>`) works end-to-end without
+hitting the database. Write endpoints (creating real agents, knowledge docs,
+etc.) return `403 DEMO_KEY_READ_ONLY` with a `signupUrl`. Tell the user to
+swap in their own `fj_live_…` key when they're ready for real responses.
+
 ## Core Integration: TypeScript Client
 
 ```typescript
