@@ -1,6 +1,6 @@
 ---
 name: flapjack-integration
-version: 1.3.0
+version: 1.4.0
 author: Flapjack
 description: Use when implementing Flapjack AI agents into an existing or new application — installing the SDK, setting up FlapjackClient, creating threads, streaming messages, embedding chat UIs with React hooks, or connecting to the Flapjack API. Triggers on mentions of flapjack, @maats/flapjack, FlapjackClient, useChat with flapjack, or AI agent embedding.
 tags:
@@ -133,6 +133,40 @@ for await (const event of client.sendMessage(thread.id, 'Check order #123', {
 await client.stopThread(thread.id);
 ```
 
+### Knowledge (RAG) Documents
+
+The SDK exposes the knowledge endpoints directly — useful for one-off
+seed scripts that upload your docs, or admin tooling that lists/deletes
+documents.
+
+```typescript
+// Upload a document for the agent's RAG store. File | Blob accepted.
+const md = await readFile('docs/quickstart.md', 'utf8');
+const blob = new Blob([md], { type: 'text/markdown' });
+const doc = await client.uploadDocument(agentId, blob, 'Quickstart');
+
+// List existing documents on the agent
+const docs = await client.listDocuments(agentId);
+
+// Delete a document
+await client.deleteDocument(doc.id);
+```
+
+**Important — built-in knowledge retrieval is silent.** When the agent
+processes a turn, the engine pre-fetches the top-N matching chunks via
+pgvector and injects them into the prompt as context. **No `tool_call`
+SSE event fires for the built-in RAG path.** If your UI is listening
+for `tool_call` events to render a "Searched: …" badge, the badge will
+never fire from built-in knowledge — it only fires for *configured*
+tools (custom webhook tools, MCP, web search, computer use). To
+surface knowledge usage today, fetch the underlying chunks separately
+(e.g. via your own per-message `/sources` route on the server side).
+Pattern: store the message ID from the `done` event, then look up
+which chunks the engine retrieved for that turn.
+
+For very large doc sets, prefer to seed with a Node script outside
+your Next.js dev server — `npm run seed:knowledge` style.
+
 ## React Integration
 
 ### Provider + useChat Hook
@@ -232,12 +266,76 @@ import { ChatPanel, FloatingChat, PlanPanel } from '@maats/flapjack/components';
 
 Available: `ChatPanel`, `ChatMessages`, `ChatMessage`, `ChatInput`, `ChatEmpty`, `ChatLoading`, `ChatToolCall`, `FloatingChat`, `PlanPanel`.
 
+### useFlapjack: drop down to the underlying client
+
+`useChat` owns the message-list state — `messages` is a flat list of
+role + content pairs and you can't change its shape. When you need
+assistant turns to carry extra fields (sources, citations, embedded
+actions, per-turn metadata, anything you'd render in a side panel) or
+want to render tool activity from custom tools / MCP / computer-use as
+inline badges, drop down to the underlying client and drive the SSE
+iterator yourself.
+
+```tsx
+import { useFlapjack } from '@maats/flapjack/react';
+
+type ChatMessage =
+  | { id: string; role: 'user'; content: string }
+  // your own assistant shape — extend as needed
+  | { id: string; role: 'assistant'; content: string; sources?: Source[]; streaming: boolean };
+
+function CustomChat({ agentId }: { agentId: string }) {
+  const { client } = useFlapjack();
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const threadIdRef = useRef<string | null>(null);
+
+  async function send(text: string) {
+    const userId = crypto.randomUUID();
+    const assistantId = crypto.randomUUID();
+    setMessages((m) => [
+      ...m,
+      { id: userId, role: 'user', content: text },
+      { id: assistantId, role: 'assistant', content: '', streaming: true },
+    ]);
+
+    if (!threadIdRef.current) {
+      const thread = await client.createThread({ agentId });
+      threadIdRef.current = thread.id;
+    }
+
+    for await (const ev of client.sendMessage(threadIdRef.current, text)) {
+      setMessages((m) => m.map((msg) => {
+        if (msg.id !== assistantId || msg.role !== 'assistant') return msg;
+        if (ev.type === 'token') return { ...msg, content: msg.content + ev.delta };
+        if (ev.type === 'done')  return { ...msg, content: msg.content || ev.content, streaming: false };
+        // ev.type === 'tool_call' / 'tool_result' — fan out into your own UI
+        return msg;
+      }));
+    }
+  }
+  // …render messages with whatever shape you like
+}
+```
+
+This is the right reach when `useChat` doesn't expose enough — but
+reach for `useChat` first; only drop down when you actually need to
+extend the message shape.
+
 ### Server-Side Proxy Pattern (Recommended for Production)
 
-Instead of exposing API keys client-side, create a proxy route:
+Don't ship `fj_live_…` keys to the browser. Instead, mount **path-mirrored**
+proxy routes in your app — `/api/threads/…`, `/api/agents/…`, etc., the
+same paths Flapjack itself serves — and configure the client SDK with
+`baseUrl: ''` so it hits same-origin URLs that you control. The browser
+never sees the real key.
+
+The proxy has two shapes: **non-streaming routes** (calls the SDK
+server-side and forwards the JSON result), and the **streaming SSE
+route** for `POST /api/threads/:id/messages` (pipes upstream bytes
+straight through so client aborts propagate to upstream).
 
 ```typescript
-// app/api/flapjack/agents/route.ts (Next.js)
+// app/api/agents/route.ts (Next.js) — non-streaming
 import { FlapjackClient } from '@maats/flapjack';
 
 const client = new FlapjackClient({
@@ -246,50 +344,113 @@ const client = new FlapjackClient({
 });
 
 export async function GET() {
+  // …add your auth check here — throw 401 if the caller isn't signed in.
   const agents = await client.listAgents();
   return Response.json(agents);
 }
 ```
 
 ```typescript
-// app/api/flapjack/threads/[threadId]/messages/route.ts
-import { FlapjackClient } from '@maats/flapjack';
+// app/api/threads/[threadId]/messages/route.ts — streaming SSE
+//
+// Recommended pattern: pipe the upstream body straight through. No
+// re-encoding, no iterator, and the upstream fetch is bound to the
+// browser's signal so closing the tab aborts the upstream LLM call
+// instead of letting it run to completion on Flapjack's bill.
+export const runtime = 'nodejs';
 
-const client = new FlapjackClient({
-  apiKey: process.env.FLAPJACK_API_KEY!,
-  baseUrl: process.env.FLAPJACK_BASE_URL!,
-});
+const FLAPJACK_BASE_URL = process.env.FLAPJACK_BASE_URL ?? 'https://api.flapjack.dev';
+const FLAPJACK_API_KEY = process.env.FLAPJACK_API_KEY!;
 
-export async function POST(req: Request, { params }: { params: Promise<{ threadId: string }> }) {
+export async function POST(
+  req: Request,
+  { params }: { params: Promise<{ threadId: string }> },
+) {
+  // …auth check first; 401 if needed.
   const { threadId } = await params;
-  const { content } = await req.json();
 
-  const stream = new ReadableStream({
-    async start(controller) {
-      const encoder = new TextEncoder();
-      const write = (type: string, data: unknown) =>
-        controller.enqueue(encoder.encode(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`));
-      try {
-        for await (const event of client.sendMessage(threadId, content)) {
-          write(event.type, event);
-        }
-      } catch (err) {
-        write('error', { code: 'STREAM_FAILURE', detail: err instanceof Error ? err.message : 'UNKNOWN' });
-      } finally {
-        controller.close();
-      }
+  const upstream = await fetch(
+    `${FLAPJACK_BASE_URL}/api/threads/${encodeURIComponent(threadId)}/messages`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${FLAPJACK_API_KEY}`,
+        'Content-Type': req.headers.get('content-type') ?? 'application/json',
+      },
+      body: req.body,
+      // @ts-expect-error — Node's fetch requires duplex: 'half' for stream bodies.
+      duplex: 'half',
+      signal: req.signal,
     },
-  });
+  );
 
-  return new Response(stream, {
+  if (!upstream.ok || !upstream.body) {
+    const text = await upstream.text().catch(() => '');
+    return new Response(text || JSON.stringify({ error: `HTTP ${upstream.status}` }), {
+      status: upstream.status,
+      headers: { 'Content-Type': upstream.headers.get('content-type') ?? 'application/json' },
+    });
+  }
+
+  return new Response(upstream.body, {
     headers: {
       'Content-Type': 'text/event-stream; charset=utf-8',
       'Cache-Control': 'no-cache, no-transform',
       Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
     },
   });
 }
 ```
+
+**Why pass-through and not the SDK iterator?** An older pattern wraps
+`for await (const event of client.sendMessage(...))` in a
+`ReadableStream` + `controller.enqueue` and re-encodes each event back
+to SSE. It works, but: (1) it decodes and re-encodes every byte for no
+reason, (2) it doesn't propagate `req.signal` upstream by default, so
+the upstream LLM call keeps running after the browser disconnects, and
+(3) it adds another error surface. Pipe the body, forward the signal,
+return `upstream.body` — done.
+
+**Pair it with the matching client config.** Because the proxy is
+path-mirrored, the client SDK runs unchanged with `baseUrl: ''`:
+
+```tsx
+'use client';
+import { FlapjackProvider } from '@maats/flapjack/react';
+
+// `apiKey` is required by the SDK but is a sentinel here — the real
+// fj_live_… key lives only on the server. The proxy ignores whatever
+// the client sends and uses its own.
+export function Providers({ children }: { children: React.ReactNode }) {
+  return (
+    <FlapjackProvider config={{ apiKey: 'proxy', baseUrl: '' }}>
+      {children}
+    </FlapjackProvider>
+  );
+}
+```
+
+**Path-mirrored vs. prefixed.** Mirroring (`/api/threads/...`) +
+`baseUrl: ''` is the simplest setup — the SDK builds URLs as
+`/api/threads/:id/...` and they resolve to your routes directly. If you
+have to namespace under a prefix (e.g. `/api/flapjack/threads/...`),
+that works too — set `baseUrl: '/api/flapjack'`. Stick with one. Path
+order matters: nesting non-Flapjack routes under the same prefix can
+shadow the SDK's expected paths.
+
+**The full proxy surface for a chat-only integration** is four
+non-streaming routes and one streaming route:
+
+| Method | Path | Forwards to | Notes |
+|--------|------|-------------|-------|
+| `GET`  | `/api/agents`                            | `client.listAgents()` | Used by the SDK to populate agent pickers; skip if you hard-code an agent ID. |
+| `POST` | `/api/threads`                           | `client.createThread({ agentId })` | |
+| `POST` | `/api/threads/:threadId/messages`        | streaming SSE — see above | The only streaming route. |
+| `POST` | `/api/threads/:threadId/stop`            | `client.stopThread(threadId)` | |
+
+Add knowledge / plan / runner routes as needed — same proxy shape, gated
+by your auth.
 
 ## SSE Event Types
 
@@ -305,6 +466,14 @@ All streaming responses use Server-Sent Events with these event types:
 | `requires_action` | `toolCalls: ToolCall[]` | Agent requests client-side tool execution. Handle via `onToolCall` or `submitToolResults()`. |
 | `done` | `ok: boolean, messageId?: string, content: string` | Full final response with persisted message ID |
 | `error` | `code: string, detail?: string` | Error occurred |
+
+> **Note:** Built-in knowledge retrieval is **silent** — chunks are
+> pre-fetched + injected into the prompt without firing a `tool_call`
+> event. `tool_call` only fires for *configured* tools (custom
+> webhooks, MCP, web search, computer use). Don't wire a "Searched: …"
+> retrieval badge to `tool_call` for built-in knowledge — it won't
+> ever fire. See the Knowledge section above for how to surface RAG
+> activity.
 
 ## API Endpoints Reference
 
@@ -486,6 +655,10 @@ Messages with `systemMessage` metadata render via the `SystemUserMessage` compon
 | Missing `done` event handling | `done` carries the full final text — persist or display it |
 | Using wrong base URL | Production: `https://api.flapjack.dev`, local: `http://localhost:3000` |
 | Using `sendMessage` for system activity | Use `addSystemMessage` — renders as a pill, not a user bubble |
+| Wiring a retrieval badge to `tool_call` for built-in knowledge | Built-in RAG is silent — no `tool_call` event fires. Fetch sources separately keyed by message ID. |
+| Re-encoding the streaming proxy with `controller.enqueue` | Pipe upstream `body` through; pass `signal: req.signal` so client aborts cancel the upstream call. |
+| Mounting proxy at `/api/flapjack/threads/...` with `baseUrl: ''` | Either path-mirror at `/api/threads/...` (preferred) or use `baseUrl: '/api/flapjack'`. The two have to agree. |
+| Shipping `apiKey: process.env.NEXT_PUBLIC_FLAPJACK_API_KEY` in production | That ships your `fj_live_…` to every browser. Use the proxy + `apiKey: 'proxy', baseUrl: ''` pattern instead. |
 
 ## Agent Configuration
 
