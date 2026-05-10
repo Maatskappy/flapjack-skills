@@ -1,6 +1,6 @@
 ---
 name: flapjack-integration
-version: 1.4.0
+version: 1.4.2
 author: Flapjack
 description: Use when implementing Flapjack AI agents into an existing or new application — installing the SDK, setting up FlapjackClient, creating threads, streaming messages, embedding chat UIs with React hooks, or connecting to the Flapjack API. Triggers on mentions of flapjack, @maats/flapjack, FlapjackClient, useChat with flapjack, or AI agent embedding.
 tags:
@@ -603,6 +603,7 @@ Agents can be configured with these LLM models (set via dashboard or API):
 | `gpt-5.4-mini` | OpenAI | Cheaper, faster |
 | `gpt-5.4-nano` | OpenAI | High-volume, lowest cost |
 | `claude-opus-4-7` | Anthropic | Deepest reasoning, 1M context |
+| `claude-opus-4-6` | Anthropic | Previous-generation Opus, 1M context |
 | `claude-sonnet-4-6` | Anthropic | Near-Opus quality, 1M context |
 | `claude-haiku-4-5` | Anthropic | Fastest, lowest cost |
 
@@ -682,7 +683,39 @@ The `stable_preamble` is the system prompt that shapes agent behavior. Write it 
 
 When an agent uses a Claude model (`claude-*`), the runtime automatically enables:
 
-- **Prompt caching:** `cache_control: { type: 'ephemeral' }` on the system prompt and the last user message. This saves ~90% on input tokens for multi-turn conversations with large system prompts. No configuration needed — it's on by default.
+- **Prompt caching:** Enabled by default with up to four cache breakpoints per
+  request (tools, system, prior compaction summary, and last user message).
+  Tool definitions are cached as one prefix so adding/swapping tools mid-thread
+  invalidates them — keep tools stable for a thread to maximise hit rate.
+
+  Per-model minimum cacheable prompt size is enforced — `claude-opus-4-7`,
+  `claude-opus-4-6`, and `claude-haiku-4-5` need at least **4096 input tokens**;
+  `claude-sonnet-4-6` needs **2048**; older models accept down to **1024**.
+  Below the threshold the request runs uncached (no error). Check the `done`
+  event's `usage.cache_read_tokens` / `usage.cache_write_tokens` — both 0 means
+  the prompt was too small.
+
+  Optional 1-hour TTL for low-frequency traffic (cron-driven runners, infrequent
+  re-engagement) — opt in with `anthropicOverrides.cache.ttl: '1h'`. Default
+  `5m` is best for chat. 5m writes cost 1.25x base; 1h writes cost 2x base;
+  reads cost 0.1x base for both.
+
+  Override surface (all optional):
+
+  ```ts
+  for await (const event of client.sendMessage(threadId, content, {
+    anthropicOverrides: {
+      cache: {
+        disabled: false,         // turn caching off entirely (debugging)
+        ttl: '5m',               // or '1h' for low-frequency traffic
+        cacheTools: true,        // disable when tool defs vary per request
+      },
+    },
+  })) {
+    // handle event
+  }
+  ```
+
 - **Context management betas:** Beta headers for extended output and interleaved thinking are sent automatically.
 
 Additional Anthropic features can be enabled per-message via `anthropicOverrides`:
@@ -713,8 +746,52 @@ for await (const event of client.sendMessage(thread.id, 'Hello', {
 type AnthropicOverrides = {
   thinking?: { enabled: boolean; budgetTokens?: number };  // default budget: 10000
   fallbackModels?: string[];  // tried in order on compatible errors
+  cache?: {
+    disabled?: boolean;
+    ttl?: '5m' | '1h';
+    cacheTools?: boolean;
+  };
 };
 ```
+
+### OpenAI-Specific Features (GPT Models)
+
+OpenAI's prompt cache is **fully automatic** for prompts ≥1024 tokens on
+`gpt-4o` and newer. Cache reads are discounted: gpt-5.4 family caches input
+tokens at roughly 0.1x base (a ~90% discount); older models like gpt-4o
+cache at 0.5x base (~50%). Check OpenAI's pricing page for the exact rate
+for your model. Cache writes are free — there is no separate write tier.
+
+Flapjack passes two routing parameters to maximise hit rate:
+
+- **`prompt_cache_key`** — defaults to the `thread_id`, so requests on the
+  same conversation stay on the same backend shard.
+- **`safety_identifier`** — defaults to your `org_id`. OpenAI uses it for
+  safety reporting and tenant isolation. We pass it on every request so
+  all of an org's traffic carries the same identifier.
+
+> SDK options use camelCase (`promptCacheKey`, `safetyIdentifier`); Flapjack
+> translates them to OpenAI's snake_case wire fields (`prompt_cache_key`,
+> `safety_identifier`) before forwarding the request.
+
+Override surface (all optional):
+
+```ts
+for await (const event of client.sendMessage(threadId, content, {
+  openaiOverrides: {
+    disabled: false,                          // skip both cache hints
+    promptCacheKey: 'agent-template:nps',     // share a shard across many threads
+    safetyIdentifier: hashedUserId,           // per-end-user routing
+  },
+})) {
+  // handle event
+}
+```
+
+Use `promptCacheKey` to share a cache shard across many threads of the same
+template (e.g. all "support" agent conversations route to the same shard so
+the system preamble stays warm). Per-conversation defaults are best for
+chat workloads where each thread is its own long-lived context.
 
 ## Features Available to Agents
 
