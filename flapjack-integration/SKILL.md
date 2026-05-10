@@ -1,6 +1,6 @@
 ---
 name: flapjack-integration
-version: 1.4.1
+version: 1.4.2
 author: Flapjack
 description: Use when implementing Flapjack AI agents into an existing or new application — installing the SDK, setting up FlapjackClient, creating threads, streaming messages, embedding chat UIs with React hooks, or connecting to the Flapjack API. Triggers on mentions of flapjack, @maats/flapjack, FlapjackClient, useChat with flapjack, or AI agent embedding.
 tags:
@@ -603,6 +603,7 @@ Agents can be configured with these LLM models (set via dashboard or API):
 | `gpt-5.4-mini` | OpenAI | Cheaper, faster |
 | `gpt-5.4-nano` | OpenAI | High-volume, lowest cost |
 | `claude-opus-4-7` | Anthropic | Deepest reasoning, 1M context |
+| `claude-opus-4-6` | Anthropic | Previous-generation Opus, 1M context |
 | `claude-sonnet-4-6` | Anthropic | Near-Opus quality, 1M context |
 | `claude-haiku-4-5` | Anthropic | Fastest, lowest cost |
 
@@ -702,7 +703,7 @@ When an agent uses a Claude model (`claude-*`), the runtime automatically enable
   Override surface (all optional):
 
   ```ts
-  await client.sendMessage(threadId, content, {
+  for await (const event of client.sendMessage(threadId, content, {
     anthropicOverrides: {
       cache: {
         disabled: false,         // turn caching off entirely (debugging)
@@ -710,8 +711,11 @@ When an agent uses a Claude model (`claude-*`), the runtime automatically enable
         cacheTools: true,        // disable when tool defs vary per request
       },
     },
-  });
+  })) {
+    // handle event
+  }
   ```
+
 - **Context management betas:** Beta headers for extended output and interleaved thinking are sent automatically.
 
 Additional Anthropic features can be enabled per-message via `anthropicOverrides`:
@@ -742,34 +746,46 @@ for await (const event of client.sendMessage(thread.id, 'Hello', {
 type AnthropicOverrides = {
   thinking?: { enabled: boolean; budgetTokens?: number };  // default budget: 10000
   fallbackModels?: string[];  // tried in order on compatible errors
+  cache?: {
+    disabled?: boolean;
+    ttl?: '5m' | '1h';
+    cacheTools?: boolean;
+  };
 };
 ```
 
 ### OpenAI-Specific Features (GPT Models)
 
 OpenAI's prompt cache is **fully automatic** for prompts ≥1024 tokens on
-`gpt-4o` and newer. Cache reads receive a **90% discount** (priced at 0.1x
-base input). There is no separate "write" tier — cache writes are free.
+`gpt-4o` and newer. Cache reads are discounted: gpt-5.4 family caches input
+tokens at roughly 0.1x base (a ~90% discount); older models like gpt-4o
+cache at 0.5x base (~50%). Check OpenAI's pricing page for the exact rate
+for your model. Cache writes are free — there is no separate write tier.
 
 Flapjack passes two routing parameters to maximise hit rate:
 
 - **`prompt_cache_key`** — defaults to the `thread_id`, so requests on the
-  same conversation stay on the same backend shard. Each shard handles
-  ~15 RPM for a given prefix; spreading thinly across shards loses cache
-  reuse.
-- **`safety_identifier`** — defaults to your `org_id`, used both for safety
-  reporting and as a secondary cache routing signal.
+  same conversation stay on the same backend shard.
+- **`safety_identifier`** — defaults to your `org_id`. OpenAI uses it for
+  safety reporting and tenant isolation. We pass it on every request so
+  all of an org's traffic carries the same identifier.
+
+> SDK options use camelCase (`promptCacheKey`, `safetyIdentifier`); Flapjack
+> translates them to OpenAI's snake_case wire fields (`prompt_cache_key`,
+> `safety_identifier`) before forwarding the request.
 
 Override surface (all optional):
 
 ```ts
-await client.sendMessage(threadId, content, {
+for await (const event of client.sendMessage(threadId, content, {
   openaiOverrides: {
     disabled: false,                          // skip both cache hints
     promptCacheKey: 'agent-template:nps',     // share a shard across many threads
     safetyIdentifier: hashedUserId,           // per-end-user routing
   },
-});
+})) {
+  // handle event
+}
 ```
 
 Use `promptCacheKey` to share a cache shard across many threads of the same
